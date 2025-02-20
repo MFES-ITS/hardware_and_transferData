@@ -1,79 +1,165 @@
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 
-// Wi-Fi credentials
-const char *ssid = "kiwkiw";  // Replace with your Wi-Fi SSID
-const char *password = "12345678"; // Replace with your Wi-Fi password
+// UUID for BLE Service and Characteristic
+#define SERVICE_UUID "abda6195-ac4d-445f-99d5-bff9d9ae3c4e"
+#define CHARACTERISTIC_UUID "58e6af79-6625-4b21-8671-595ecd5a1d71"
 
-// Application endpoint (replace with your server's IP or domain)
-const char *applicationURL = "http://192.168.166.20:5000/monitor"; // Replace with your app endpoint
+// Backend API Endpoint
+const char *applicationURL = "http://34.160.63.178:80/monitor";
+const char *sensorID = "monitor0";
 
-// Unique identifier for this sensor
-const char *sensorID = "monitor0"; // Replace with a unique sensor ID
+BLECharacteristic *pCharacteristic;
+bool newCredentialsReceived = false;
+String wifiSSID = "";
+String wifiPassword = "";
 
-// Function to generate random heart rate and pulse oximeter values
-int generateRandomHeartRate() {
-  return random(60, 100); // Generate heart rate between 60 and 100 BPM
-}
+// BLE Callback to Handle Connections
+class MyServerCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+        Serial.println("✅ BLE Client Connected!");
+    }
 
-int generateRandomPulseOximeter() {
-  return random(95, 100); // Generate pulse oximeter value between 95% and 100%
-}
+    void onDisconnect(BLEServer* pServer) {
+        Serial.println("❌ BLE Client Disconnected!");
+        pServer->startAdvertising();  // Restart advertising
+    }
+};
+
+// BLE Callback to Receive Wi-Fi Credentials
+class MyCallbacks : public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pCharacteristic) override {
+        String rawData = pCharacteristic->getValue();
+        Serial.print("📜 Received data: ");
+        Serial.println(rawData.c_str());
+
+        // Extract Wi-Fi SSID & Password
+        int splitIndex = rawData.indexOf(':');
+        if (splitIndex != -1) {
+            wifiSSID = rawData.substring(0, splitIndex);
+            wifiPassword = rawData.substring(splitIndex + 1);
+            newCredentialsReceived = true;
+
+            Serial.println("✅ Wi-Fi SSID: " + wifiSSID);
+            Serial.println("✅ Wi-Fi Password: " + wifiPassword);
+        } else {
+            Serial.println("❌ Error: Invalid Wi-Fi credentials format!");
+        }
+    }
+};
 
 void setup() {
-  Serial.begin(115200);
+    Serial.begin(115200);
+    WiFi.mode(WIFI_STA);  // ✅ Ensure ESP32 is in Station mode
 
-  // Seed the random number generator with a unique value (time-based)
-  randomSeed(analogRead(0));
+    // Initialize BLE
+    BLEDevice::init("ESP32_BLE_WIFI_SETUP");
+    BLEServer *pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new MyServerCallbacks());
 
-  // Connect to Wi-Fi
-  WiFi.begin(ssid, password);
-  Serial.println("Connecting to Wi-Fi...");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.println("\nConnected to Wi-Fi");
-  Serial.printf("Device IP Address: %s\n", WiFi.localIP().toString().c_str());
+    BLEService *pService = pServer->createService(SERVICE_UUID);
+    pCharacteristic = pService->createCharacteristic(
+        CHARACTERISTIC_UUID,
+        BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY
+    );
+
+    pCharacteristic->setCallbacks(new MyCallbacks());
+    pService->start();
+
+    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+    pAdvertising->addServiceUUID(SERVICE_UUID);
+    pAdvertising->setScanResponse(true);
+    pAdvertising->setMinPreferred(0x06);
+    pAdvertising->start();
+
+    Serial.println("✅ BLE Service Started. Advertising...");
 }
 
 void loop() {
-  if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
+    // Check if Wi-Fi credentials are received and connect
+    if (newCredentialsReceived) {
+        Serial.println("📶 Connecting to Wi-Fi...");
 
-    // Generate random heart rate and pulse oximeter values
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("⚠️ Already connected. Disconnecting...");
+            WiFi.disconnect(true);
+            delay(1000);
+        }
+
+        WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
+
+        int counter = 0;
+        while (WiFi.status() != WL_CONNECTED && counter < 20) {
+            delay(1000);
+            Serial.print(".");
+            counter++;
+        }
+
+        if (WiFi.status() == WL_CONNECTED) {
+            Serial.println("\n✅ Wi-Fi Connected!");
+            pCharacteristic->setValue("SUCCESS");
+            sendSensorData();
+        } else {
+            Serial.println("\n❌ Failed to connect!");
+            pCharacteristic->setValue("FAILED");
+        }
+
+        pCharacteristic->notify();  // Notify Flutter App
+        newCredentialsReceived = false;
+    }
+
+    // If Wi-Fi is connected, check sensor data
+    if (WiFi.status() == WL_CONNECTED) {
+        sendSensorData();
+    } else {
+        Serial.println("❌ Wi-Fi disconnected. Reconnecting...");
+        WiFi.begin(wifiSSID.c_str(), wifiPassword.c_str());
+    }
+
+    delay(5000);  // Adjust delay for real-time detection
+}
+
+// Generate random heart rate & pulse oximeter values
+int generateRandomHeartRate() {
+    return random(60, 100);
+}
+
+int generateRandomPulseOximeter() {
+    return random(95, 100);
+}
+
+// Send data to the server
+void sendSensorData() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("❌ Cannot send data, Wi-Fi not connected!");
+        return;
+    }
+
+    HTTPClient http;
+    http.begin(applicationURL);
+    http.addHeader("Content-Type", "application/json");
+
     int heartRate = generateRandomHeartRate();
     int pulseOximeter = generateRandomPulseOximeter();
 
-    // Create JSON payload
     String payload = "{";
-    payload += "\"monitorID\":\"" + String(sensorID) + "\","; // Add sensorID to the payload
-    payload += "\"heartRate\":" + String(heartRate) + ","; // Heart rate value
-    payload += "\"pulseOximeter\":" + String(pulseOximeter); // Pulse oximeter value
+    payload += "\"monitorID\":\"" + String(sensorID) + "\",";
+    payload += "\"heartRate\":" + String(heartRate) + ",";
+    payload += "\"pulseOximeter\":" + String(pulseOximeter);
     payload += "}";
 
-    // Print payload to Serial Monitor
-    Serial.println("\n[DEBUG] Data Sent to Flask:");
-    Serial.println(payload);
-
-    // Send POST request to the application
-    http.begin(applicationURL);
-    http.addHeader("Content-Type", "application/json");
+    Serial.println("\n📤 Sending Data: " + payload);
     int httpResponseCode = http.POST(payload);
 
-    // Check the response
     if (httpResponseCode > 0) {
-      String response = http.getString();
-      Serial.println("[DEBUG] Response from Flask: " + response);
+        String response = http.getString();
+        Serial.printf("✅ Response: %s\n", response.c_str());
     } else {
-      Serial.printf("[ERROR] Failed to send POST: %s\n", http.errorToString(httpResponseCode).c_str());
+        Serial.printf("❌ Error on sending POST: %s\n", http.errorToString(httpResponseCode).c_str());
     }
 
     http.end();
-  } else {
-    Serial.println("[ERROR] Wi-Fi disconnected. Reconnecting...");
-    WiFi.begin(ssid, password);
-  }
-
-  delay(5000); // Send data every 5 seconds
 }
